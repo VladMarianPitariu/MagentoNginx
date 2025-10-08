@@ -14,13 +14,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare .env
+      - name: Create .env file
         run: |
-          cp .env.example .env
-          # Set the OpenSearch password required by 2.12+
-          sed -i "s/^OPENSEARCH_PASSWORD=.*/OPENSEARCH_PASSWORD=${OPENSEARCH_PASSWORD}/" .env
-        env:
-          OPENSEARCH_PASSWORD: ${{ secrets.OPENSEARCH_PASSWORD }}
+          cat > .env <<'EOF'
+          MAGENTO_VERSION=2.4.7
+          DB_HOST=db
+          DB_NAME=magento
+          DB_USER=magento
+          DB_PASSWORD=magento
+          OPENSEARCH_HOST=opensearch
+          OPENSEARCH_PORT=9200
+          OPENSEARCH_PASSWORD=${{ secrets.OPENSEARCH_PASSWORD }}
+          EOF
+
 
       - name: Increase vm.max_map_count for OpenSearch
         run: |
