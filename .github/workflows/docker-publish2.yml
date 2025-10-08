@@ -1,0 +1,134 @@
+# .github/workflows/ci.yml
+name: CI - Build & Smoke Test Magento Stack
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare .env
+        run: |
+          cp .env.example .env
+          # Set the OpenSearch password required by 2.12+
+          sed -i "s/^OPENSEARCH_PASSWORD=.*/OPENSEARCH_PASSWORD=${OPENSEARCH_PASSWORD}/" .env
+        env:
+          OPENSEARCH_PASSWORD: ${{ secrets.OPENSEARCH_PASSWORD }}
+
+      - name: Increase vm.max_map_count for OpenSearch
+        run: |
+          sudo sysctl -w vm.max_map_count=262144
+          sudo bash -lc 'echo "vm.max_map_count=262144" > /etc/sysctl.d/99-opensearch.conf'
+          sudo sysctl --system
+        # OpenSearch 2.x on Linux needs this, even for single-node dev. 
+        # (Mirrors the README tip.) 
+        # Ref: your README notes.
+      
+      - name: Enable Docker BuildKit (faster builds)
+        run: |
+          echo "DOCKER_BUILDKIT=1" | sudo tee -a /etc/environment
+
+      - name: Docker compose up (build images)
+        run: docker compose up -d --build
+        # Starts nginx, php-fpm, db, opensearch per docker-compose.yml
+
+      - name: Wait for OpenSearch to be healthy
+        run: |
+          for i in {1..60}; do
+            if curl -sS http://localhost:9200 >/dev/null; then
+              echo "OpenSearch is up"; break
+            fi
+            echo "Waiting for OpenSearch... ($i)"; sleep 5
+          done
+
+      - name: Create Magento project (inside php container)
+        run: |
+          docker compose exec -T php bash -lc '
+            export COMPOSER_MEMORY_LIMIT=-1
+            composer --version
+            composer config --global http-basic.repo.magento.com "${MAGENTO_PUBLIC_KEY}" "${MAGENTO_PRIVATE_KEY}"
+            composer create-project --repository-url=https://repo.magento.com/ --no-interaction --prefer-dist \
+              magento/project-community-edition /var/www/html
+          '
+        env:
+          MAGENTO_PUBLIC_KEY: ${{ secrets.MAGENTO_PUBLIC_KEY }}
+          MAGENTO_PRIVATE_KEY: ${{ secrets.MAGENTO_PRIVATE_KEY }}
+        # Matches your README's quick-start sequence. :contentReference[oaicite:1]{index=1}
+
+      - name: Dev-safe permissions
+        run: |
+          docker compose exec -T php bash -lc '
+            cd /var/www/html && \
+            mkdir -p var/cache var/page_cache var/session generated pub/static pub/media app/etc && \
+            chown -R www-data:www-data var generated pub/static pub/media app/etc && \
+            find var generated pub/static pub/media app/etc -type d -exec chmod 775 {} + && \
+            find var generated pub/static pub/media app/etc -type f -exec chmod 664 {} + && \
+            chmod g+s var generated pub/static pub/media app/etc && \
+            chmod u+x bin/magento
+          '
+        # Same as README step 4. :contentReference[oaicite:2]{index=2}
+
+      - name: Magento install (CLI)
+        run: |
+          docker compose exec -T php php -d memory_limit=-1 bin/magento setup:install \
+            --base-url="http://localhost:8080/" \
+            --db-host=db --db-name=magento --db-user=magento --db-password=magento \
+            --admin-firstname=Admin --admin-lastname=User \
+            --admin-email=admin@example.com --admin-user=admin --admin-password='Admin123!' \
+            --language=en_US --currency=USD --timezone=UTC --use-rewrites=1 \
+            --search-engine=opensearch --opensearch-host=opensearch --opensearch-port=9200 \
+            --opensearch-timeout=30
+        # Mirrors README step 5. :contentReference[oaicite:3]{index=3}
+
+      - name: Base URLs & dev tuning
+        run: |
+          docker compose exec -T php bin/magento setup:store-config:set \
+            --base-url="http://localhost:8080/" \
+            --base-url-secure="http://localhost:8080/"
+          docker compose exec -T php bin/magento config:set dev/static/sign 0
+          docker compose exec -T php bin/magento deploy:mode:set developer
+        # Matches README step 6. :contentReference[oaicite:4]{index=4}
+
+      - name: Deploy static content (lean mode) and flush cache
+        run: |
+          docker compose exec -T php bash -lc '
+            cd /var/www/html && \
+            find pub/static -mindepth 1 -maxdepth 1 ! -name ".htaccess" -exec rm -rf {} + ; \
+            rm -rf var/view_preprocessed/* generated/* || true
+          '
+          docker compose exec -T php php -d memory_limit=2G bin/magento setup:static-content:deploy -f \
+            --area frontend --theme Magento/luma  en_US --jobs 1 -s standard
+          docker compose exec -T php php -d memory_limit=2G bin/magento setup:static-content:deploy -f \
+            --area adminhtml --theme Magento/backend en_US --jobs 1 -s standard
+          docker compose exec -T php bin/magento cache:flush
+        # Mirrors README step 7. :contentReference[oaicite:5]{index=5}
+
+      - name: Smoke check (Nginx serving /pub)
+        run: |
+          # Give Nginx/PHP a few seconds
+          for i in {1..30}; do
+            if curl -sSf http://localhost:8080/ >/dev/null; then
+              echo "Storefront is responding"
+              exit 0
+            fi
+            echo "Waiting for storefront... ($i)"
+            sleep 5
+          done
+          echo "Storefront did not respond in time"
+          exit 1
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          docker compose ps
+          docker compose logs nginx || true
+          docker compose logs php || true
+          docker compose logs db || true
+          docker compose logs opensearch || true
