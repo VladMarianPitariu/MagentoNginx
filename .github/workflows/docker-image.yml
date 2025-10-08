@@ -1,0 +1,122 @@
+name: Magento Smoke Test (Docker)
+
+on:
+  workflow_dispatch: {}   # run manually when you want
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      OPENSEARCH_PASSWORD: ${{ secrets.OPENSEARCH_PASSWORD }}
+      MAGENTO_PUBLIC_KEY: ${{ secrets.MAGENTO_PUBLIC_KEY }}
+      MAGENTO_PRIVATE_KEY: ${{ secrets.MAGENTO_PRIVATE_KEY }}
+      COMPOSE_DOCKER_CLI_BUILD: 1
+      DOCKER_BUILDKIT: 1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space (helps large Composer installs)
+        run: |
+          sudo rm -rf /usr/local/lib/android || true
+          docker system prune -af || true
+
+      - name: Ensure vm.max_map_count for OpenSearch
+        run: |
+          sudo sysctl -w vm.max_map_count=262144
+          sudo sysctl -a | grep vm.max_map_count
+
+      - name: Build PHP image (with all PHP extensions)
+        run: docker compose build php
+
+      - name: Start infra (db, opensearch, php, nginx)
+        run: docker compose up -d db opensearch php nginx
+
+      - name: Wait for OpenSearch to be ready
+        run: |
+          for i in {1..60}; do
+            if curl -sf http://localhost:9200 >/dev/null; then
+              echo "OpenSearch is up"; exit 0
+            fi
+            echo "Waiting for OpenSearch... ($i/60)"
+            sleep 5
+          done
+          echo "OpenSearch not ready in time" >&2
+          exit 1
+
+      - name: Composer create-project (inside php container)
+        run: |
+          docker compose run --rm php bash -lc "
+            set -e
+            export COMPOSER_MEMORY_LIMIT=-1
+            composer config --global http-basic.repo.magento.com '${MAGENTO_PUBLIC_KEY}' '${MAGENTO_PRIVATE_KEY}'
+            composer create-project --repository-url=https://repo.magento.com/ --no-interaction --prefer-dist \
+              magento/project-community-edition /var/www/html
+          "
+
+      - name: Dev-friendly permissions
+        run: |
+          docker compose exec -T php bash -lc '
+            set -e
+            cd /var/www/html
+            mkdir -p var/cache var/page_cache var/session generated pub/static pub/media app/etc
+            chown -R www-data:www-data var generated pub/static pub/media app/etc
+            find var generated pub/static pub/media app/etc -type d -exec chmod 775 {} +
+            find var generated pub/static pub/media app/etc -type f -exec chmod 664 {} +
+            chmod g+s var generated pub/static pub/media app/etc
+            chmod u+x bin/magento
+          '
+
+      - name: Install Magento
+        run: |
+          docker compose exec -T php php -d memory_limit=-1 bin/magento setup:install \
+            --base-url="http://localhost:8080/" \
+            --db-host=db --db-name=magento --db-user=magento --db-password=magento \
+            --admin-firstname=Admin --admin-lastname=User \
+            --admin-email=admin@example.com --admin-user=admin --admin-password='Admin123!' \
+            --language=en_US --currency=USD --timezone=UTC --use-rewrites=1 \
+            --search-engine=opensearch --opensearch-host=opensearch --opensearch-port=9200 \
+            --opensearch-timeout=30
+
+      - name: Dev tuning (base URLs, static signing off, developer mode)
+        run: |
+          docker compose exec -T php bin/magento setup:store-config:set \
+            --base-url="http://localhost:8080/" \
+            --base-url-secure="http://localhost:8080/"
+          docker compose exec -T php bin/magento config:set dev/static/sign 0
+          docker compose exec -T php bin/magento deploy:mode:set developer
+
+      - name: Deploy minimal static assets (admin + luma)
+        run: |
+          docker compose exec -T php bash -lc '
+            set -e
+            cd /var/www/html
+            find pub/static -mindepth 1 -maxdepth 1 ! -name ".htaccess" -exec rm -rf {} + || true
+            rm -rf var/view_preprocessed/* generated/* || true
+          '
+          docker compose exec -T php php -d memory_limit=2G bin/magento setup:static-content:deploy -f \
+            --area adminhtml --theme Magento/backend en_US --jobs 1 -s standard
+          docker compose exec -T php php -d memory_limit=2G bin/magento setup:static-content:deploy -f \
+            --area frontend --theme Magento/luma en_US --jobs 1 -s standard
+          docker compose exec -T php bin/magento cache:flush
+
+      - name: Smoke test homepage
+        run: |
+          curl -I http://localhost:8080 | tee /tmp/homepage-headers.txt
+          curl -sSf http://localhost:8080 >/tmp/homepage.html
+          grep -i "<html" /tmp/homepage.html >/dev/null
+
+      - name: Show Admin URI
+        run: docker compose exec -T php bin/magento info:adminuri
+
+      - name: Dump logs on failure (nginx/php)
+        if: failure()
+        run: |
+          docker compose logs --no-color nginx | tail -n 200
+          docker compose logs --no-color php | tail -n 200
+
+      - name: Cleanup
+        if: always()
+        run: docker compose down -v
