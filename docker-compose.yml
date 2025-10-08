@@ -41,7 +41,7 @@ services:
 
   opensearch:
     image: opensearchproject/opensearch:2.12.0
-    container_name: ${PROJECT_NAME}opensearch
+    container_name: opensearch
     environment:
       - discovery.type=single-node
       - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_PASSWORD}
