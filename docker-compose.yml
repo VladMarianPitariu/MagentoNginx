@@ -3,7 +3,7 @@ services:
   nginx:
     image: nginx:1.27-alpine
     ports:
-      - "${HOST_HTTP_PORT}:80"
+      - "8080:80"
     depends_on:
       - php
     volumes:
@@ -15,9 +15,9 @@ services:
   php:
     build: ./php
     environment:
-      PHP_MEMORY_LIMIT: ${PHP_MEMORY_LIMIT}
-      PHP_UPLOAD_MAX_FILESIZE: ${PHP_UPLOAD_MAX_FILESIZE}
-      PHP_POST_MAX_SIZE: ${PHP_POST_MAX_SIZE}
+      PHP_MEMORY_LIMIT: 2G
+      PHP_UPLOAD_MAX_FILESIZE: 64M
+      PHP_POST_MAX_SIZE: 64M
     volumes:
       - ./src:/var/www/html
     networks:
@@ -41,7 +41,7 @@ services:
     environment:
       - discovery.type=single-node
       - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_PASSWORD}
-      - OPENSEARCH_JAVA_OPTS=${OPENSEARCH_JAVA_OPTS}
+      - OPENSEARCH_JAVA_OPTS=Xms512m -Xmx512m
       - plugins.security.disabled=true
     ulimits:
       memlock:
